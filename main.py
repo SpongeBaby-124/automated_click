@@ -33,8 +33,8 @@ async def execute_task(task_description: str):
     
     print("⏳ 正在启动浏览器...\n")
     
-    # 创建自动化图
-    graph, page, browser, playwright = await create_automation_graph(
+    # 创建自动化图 (使用持久化上下文保存登录状态)
+    graph, page, context, playwright = await create_automation_graph(
         headless=False  # 显示浏览器窗口
     )
     
@@ -92,7 +92,7 @@ async def execute_task(task_description: str):
     finally:
         # 清理资源
         print("\n🧹 正在清理资源...")
-        await browser.close()
+        await context.close()
         await playwright.stop()
         print("✅ 程序结束\n")
 
@@ -110,6 +110,10 @@ def main():
     print("  - 打开谷歌搜索南京邮电大学官网")
     print("  - 打开百度搜索Python教程并点击第一个结果")
     print("  - 在淘宝搜索iPhone 15")
+    print("\n💾 登录状态保存：")
+    print("  - 浏览器数据保存在 ./browser_data 目录")
+    print("  - 登录信息、Cookies 将自动保留")
+    print("  - 下次运行时无需重复登录")
     print("\n提示：输入 'quit' 或 'exit' 退出程序")
     print("=" * 70 + "\n")
     

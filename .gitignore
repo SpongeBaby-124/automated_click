@@ -1,1 +1,5 @@
 .env
+
+# Playwright 持久化浏览器数据
+browser_data/
+.vscode/

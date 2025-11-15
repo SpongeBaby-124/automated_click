@@ -1,91 +1,112 @@
-"""视觉定位工具 - 使用 VL 模型定位并点击网页元素"""
+"""视觉执行工具 - 提供浏览器操作能力"""
 
-import base64
 import asyncio
 import os
 import re
-from typing import Tuple
-from datetime import datetime
+from typing import Dict, Optional, Tuple
 
 from openai import OpenAI
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+)
+
+from .state_utils import build_view_payload
 
 
 class VisionClickTool:
-    """使用多模态 VL 模型定位网页元素并执行点击操作"""
+    """封装具体浏览器动作，供 Tools 节点调用"""
 
-    def __init__(self, page: Page) -> None:
-        """
-        初始化视觉点击工具
-        
-        Args:
-            page: Playwright 页面对象
-        """
+    def __init__(self, page: Page, context: BrowserContext | None = None) -> None:
         self._page = page
-        self._screenshot_count = 0
-        
-        # 从环境变量获取配置
+        self._context = context
+
+        # 监听页面关闭 / 新标签打开事件，确保始终操作最新页面
+        self._register_page_close_hook(page)
+        if self._context:
+            self._context.on("page", self._handle_new_page)
+
         base_url = os.environ.get("OPENAI_API_BASE")
         api_key = os.environ.get("OPENAI_API_KEY")
         self._vision_model = os.environ.get("VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct")
-        
+
         if not base_url or not api_key:
             raise EnvironmentError("必须设置 OPENAI_API_BASE 和 OPENAI_API_KEY 环境变量")
-        
+
         self._client = OpenAI(base_url=base_url, api_key=api_key)
 
-    async def capture_state(self, label: str = "state") -> dict:
-        """对外公开的截图方法，返回路径和 base64"""
-        return await self._capture_state(label)
+    def _register_page_close_hook(self, page: Page) -> None:
+        page.on("close", lambda _: self._handle_page_closed(page))
 
-    async def _screenshot_base64(self) -> str:
-        """获取页面截图并转换为 base64 编码"""
-        screenshot = await self._page.screenshot()
-        return base64.b64encode(screenshot).decode("utf-8")
+    def _handle_new_page(self, page: Page) -> None:
+        print("🆕 检测到新窗口/标签页，自动切换到最新页面")
+        self._register_page_close_hook(page)
+        self._page = page
 
-    async def _capture_state(self, label: str) -> dict:
-        """截图记录当前页面状态并返回路径与 base64"""
-        self._screenshot_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"screenshot_{self._screenshot_count}_{timestamp}_{label}.png"
-        screenshot = await self._page.screenshot()
-        with open(filename, 'wb') as f:
-            f.write(screenshot)
-        print(f"💾 已保存调试截图: {filename}")
-        return {
-            "path": filename,
-            "base64": base64.b64encode(screenshot).decode("utf-8"),
-        }
+        async def _prepare() -> None:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 等待新页面加载时出错: {exc}")
+            try:
+                await page.bring_to_front()
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 无法将新页面置前: {exc}")
 
-    async def _save_screenshot_for_debug(self, label: str = "debug") -> str:
-        """兼容旧接口，返回截图文件路径"""
-        state = await self._capture_state(label)
-        return state["path"]
+        asyncio.create_task(_prepare())
 
-    async def _ai_locate(self, element_description: str, retry_count: int = 2) -> Tuple[int, int]:
-        """
-        使用 VL 模型定位元素坐标
-        
-        Args:
-            element_description: 元素的文字描述
-            retry_count: 重试次数
-            
-        Returns:
-            (x, y) 坐标元组
-        """
-        screenshot = await self._screenshot_base64()
-        
-        # 构建增强的提示词
-        enhanced_prompt = f"""
-请在这个网页截图中找到以下元素: '{element_description}'
+    def _handle_page_closed(self, page: Page) -> None:
+        if page != self._page:
+            return
+        next_page = self._pick_latest_page(exclude=page)
+        if next_page:
+            print("↩️ 当前页面已关闭，回退到最近的可用页面")
+            self._page = next_page
+            asyncio.create_task(next_page.bring_to_front())
 
-请仔细分析图像并返回：
-1. 该元素的中心坐标 (x, y)
-2. 坐标必须是有效的数字，范围在图像大小内
+    def _pick_latest_page(self, exclude: Page | None = None) -> Optional[Page]:
+        if not self._context:
+            return None
+        for candidate in reversed(self._context.pages):
+            if candidate == exclude:
+                continue
+            if not candidate.is_closed():
+                return candidate
+        return None
 
-只返回坐标，格式必须是 (x, y)，例如 (123, 456)
-        """.strip()
-        
+    def _require_active_page(self) -> Page:
+        if self._page and not self._page.is_closed():
+            return self._page
+        fallback = self._pick_latest_page()
+        if fallback:
+            self._page = fallback
+            return fallback
+        raise RuntimeError("当前没有可用的浏览器页面，请确认标签页未全部关闭")
+
+    def _current_url(self) -> str:
+        try:
+            return self._require_active_page().url
+        except Exception:
+            return ""
+
+    async def get_view(self, label: str = "state") -> Dict[str, object]:
+        """截取当前页面，返回供 Agent 判断的截图"""
+        page = self._require_active_page()
+        screenshot_bytes = await page.screenshot()
+        return build_view_payload(label, screenshot_bytes, page.url)
+
+    async def _ai_locate(self, element_description: str, retry_count: int = 2) -> Tuple[Tuple[int, int], Dict[str, object]]:
+        prompt = (
+            "请在这个网页截图中找到以下元素: '"
+            + element_description
+            + "'。\n\n"
+            + "请输出该元素的中心坐标，格式严格为 (x, y)。"
+        )
+
+        last_error: Optional[Exception] = None
+        view = await self.get_view("locate_element")
+
         for attempt in range(retry_count + 1):
             try:
                 response = self._client.chat.completions.create(
@@ -94,11 +115,11 @@ class VisionClickTool:
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": enhanced_prompt},
+                                {"type": "text", "text": prompt},
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": f"data:image/png;base64,{screenshot}",
+                                        "url": f"data:image/png;base64,{view['screenshot_base64']}",
                                     },
                                 },
                             ],
@@ -107,324 +128,321 @@ class VisionClickTool:
                     max_tokens=150,
                     temperature=0.1,
                 )
-                
-                result = response.choices[0].message.content
+
+                result = response.choices[0].message.content or ""
                 print(f"📍 VL 模型返回 (尝试 {attempt + 1}/{retry_count + 1}): {result}")
-                
                 coords = self._parse_coordinates(result)
                 print(f"✅ 成功解析坐标: {coords}")
-                return coords
-                
-            except Exception as e:
+                return coords, view
+
+            except Exception as exc:  # noqa: BLE001 - 捕获模型解析失败
+                last_error = exc
                 if attempt < retry_count:
-                    print(f"⚠️ 定位失败，正在重试 ({attempt + 1}/{retry_count}): {e}")
+                    print(f"⚠️ 定位失败，正在重试 ({attempt + 1}/{retry_count}): {exc}")
                     await asyncio.sleep(0.5)
                 else:
-                    await self._save_screenshot_for_debug("locate_error")
-                    raise ValueError(f"VL 模型定位失败: {e}")
+                    break
+
+        raise ValueError(f"VL 模型定位失败: {last_error}")
+
+    def _normalize_coordinates(
+        self,
+        coords: Tuple[int, int],
+        view_meta: Dict[str, object] | None,
+    ) -> Tuple[int, int]:
+        page = self._require_active_page()
+        viewport = page.viewport_size or {}
+        vp_width = viewport.get("width") or 1
+        vp_height = viewport.get("height") or 1
+
+        shot_width = (view_meta or {}).get("width") or vp_width
+        shot_height = (view_meta or {}).get("height") or vp_height
+
+        scale_x = vp_width / shot_width if shot_width else 1
+        scale_y = vp_height / shot_height if shot_height else 1
+
+        raw_x, raw_y = coords
+        adj_x = int(raw_x * scale_x)
+        adj_y = int(raw_y * scale_y)
+
+        adj_x = max(1, min(vp_width - 2, adj_x))
+        adj_y = max(1, min(vp_height - 2, adj_y))
+        return adj_x, adj_y
+
+    async def _resolve_click_target(self, x: int, y: int) -> Optional[Dict[str, object]]:
+        script = """
+        ({ x, y }) => {
+            const el = document.elementFromPoint(x, y);
+            if (!el) {
+                return null;
+            }
+            try {
+                el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            } catch (_) {}
+            const rect = el.getBoundingClientRect();
+            const anchor = el.closest('a');
+            return {
+                tag: el.tagName,
+                text: (el.innerText || '').trim().slice(0, 120),
+                href: anchor ? anchor.href : (el.href || null),
+                rect: {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                },
+                center: {
+                    x: rect.x + rect.width / 2,
+                    y: rect.y + rect.height / 2,
+                },
+            };
+        }
+        """
+
+        page = self._require_active_page()
+        return await page.evaluate(script, {"x": x, "y": y})
 
     @staticmethod
     def _parse_coordinates(text: str) -> Tuple[int, int]:
-        """
-        解析 VL 模型返回的坐标文本
-        
-        支持多种格式:
-        - (123, 456)
-        - 123, 456
-        - x=123, y=456
-        """
         patterns = [
-            r'\((\d+)\s*,\s*(\d+)\)',
-            r'^\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\s*$',
-            r'(\d+)\s*,\s*(\d+)',
-            r'x[=:]\s*(\d+).*?y[=:]\s*(\d+)',
+            r"\((\d+)\s*,\s*(\d+)\)",
+            r"^\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\s*$",
+            r"(\d+)\s*,\s*(\d+)",
+            r"x[=:]\s*(\d+).*?y[=:]\s*(\d+)",
         ]
-        
+
         for idx, pattern in enumerate(patterns):
             match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
             if match:
                 x = int(match.group(1))
                 y = int(match.group(2))
-                
                 if x < 0 or y < 0:
                     raise ValueError(f"坐标为负值: ({x}, {y})")
-                
                 print(f"✓ 使用模式 {idx + 1} 成功解析")
                 return x, y
-        
+
         raise ValueError(f"无法解析坐标，VL 模型返回: {text}")
 
     async def click_element(self, element_description: str) -> dict:
-        """
-        定位并点击指定元素
-        
-        Args:
-            element_description: 元素的文字描述
-            
-        Returns:
-            执行结果字典，包含 success, message, coordinates 等字段
-        """
         try:
             print(f"\n🔍 正在使用 VL 模型定位: {element_description}")
-            
-            # 使用 VL 模型定位坐标
-            x, y = await self._ai_locate(element_description)
-            
-            if x == 0 and y == 0:
-                screenshot = await self.capture_state("click_zero_coord")
+            (raw_x, raw_y), locate_view = await self._ai_locate(element_description)
+            normalized_x, normalized_y = self._normalize_coordinates(
+                (raw_x, raw_y),
+                locate_view.get("meta") if isinstance(locate_view, dict) else None,
+            )
+
+            if raw_x == 0 and raw_y == 0:
+                view = await self.get_view("click_zero_coord")
                 return {
                     "success": False,
                     "message": "坐标为 (0, 0)，疑似定位失败",
                     "coordinates": (0, 0),
                     "element_description": element_description,
-                    "screenshot_path": screenshot["path"],
-                    "screenshot_base64": screenshot["base64"],
+                    "current_view": view,
                 }
-            
-            # 执行点击
-            print(f"🖱️  点击位置: ({x}, {y})")
-            await self._page.mouse.click(x, y)
+
+            element_target = await self._resolve_click_target(normalized_x, normalized_y)
+            if element_target and element_target.get("center"):
+                target_x = int(element_target["center"]["x"])
+                target_y = int(element_target["center"]["y"])
+            else:
+                target_x, target_y = normalized_x, normalized_y
+
+            print(
+                "🖱️  点击位置 (原始 -> 映射 -> 最终): "
+                f"({raw_x}, {raw_y}) -> ({normalized_x}, {normalized_y}) -> ({target_x}, {target_y})"
+            )
+
+            page = self._require_active_page()
+            await page.bring_to_front()
+            await page.mouse.move(target_x, target_y)
+            await page.mouse.click(target_x, target_y)
             await asyncio.sleep(0.5)
-            
-            print(f"✓ 成功点击: {element_description}")
-            screenshot = await self.capture_state("click_success")
+
+            view = await self.get_view("click_success")
             return {
                 "success": True,
                 "message": f"成功点击 {element_description}",
-                "coordinates": (x, y),
+                "coordinates": (raw_x, raw_y),
+                "mapped_coordinates": (normalized_x, normalized_y),
+                "final_coordinates": (target_x, target_y),
+                "element_target": element_target,
                 "element_description": element_description,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "current_view": view,
             }
 
-        except Exception as e:
-            error_msg = f"点击失败: {str(e)}"
+        except Exception as exc:
+            error_msg = f"点击失败: {exc}"
             print(f"✗ {error_msg}")
-            screenshot = await self.capture_state("click_error")
-
+            view = await self.get_view("click_error")
             return {
                 "success": False,
                 "message": error_msg,
                 "element_description": element_description,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "current_view": view,
             }
 
-    async def type_text(self, text: str, delay: int = 50) -> dict:
-        """
-        在当前焦点元素输入文本
-        
-        Args:
-            text: 要输入的文本
-            delay: 每个字符的延迟(毫秒)
-            
-        Returns:
-            执行结果字典
-        """
+    async def type_text(self, text: str, delay: int = 50, press_enter: bool = False) -> dict:
         try:
             print(f"⌨️  输入文本: {text}")
-            await self._page.keyboard.type(text, delay=delay)
+            page = self._require_active_page()
+            await page.keyboard.type(text, delay=delay)
             await asyncio.sleep(0.3)
-            screenshot = await self.capture_state("type_text")
 
+            if press_enter:
+                print("⌨️  自动按下 Enter 键")
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+
+            view = await self.get_view("type_text")
             return {
                 "success": True,
-                "message": f"成功输入文本: {text}",
+                "message": f"成功输入文本: {text}" + (" 并按下 Enter" if press_enter else ""),
                 "text": text,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "press_enter": press_enter,
+                "current_view": view,
             }
-        except Exception as e:
-            screenshot = await self.capture_state("type_text_error")
+
+        except Exception as exc:
+            view = await self.get_view("type_text_error")
             return {
                 "success": False,
-                "message": f"输入文本失败: {str(e)}",
+                "message": f"输入文本失败: {exc}",
                 "text": text,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "press_enter": press_enter,
+                "current_view": view,
             }
 
     async def press_key(self, key: str) -> dict:
-        """
-        按下键盘按键
-        
-        Args:
-            key: 按键名称，如 "Enter", "Escape" 等
-            
-        Returns:
-            执行结果字典
-        """
         try:
             print(f"⌨️  按下按键: {key}")
-            await self._page.keyboard.press(key)
+            page = self._require_active_page()
+            await page.keyboard.press(key)
             await asyncio.sleep(0.3)
-            screenshot = await self.capture_state("press_key")
 
+            view = await self.get_view("press_key")
             return {
                 "success": True,
                 "message": f"成功按下按键: {key}",
                 "key": key,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "current_view": view,
             }
-        except Exception as e:
-            screenshot = await self.capture_state("press_key_error")
+
+        except Exception as exc:
+            view = await self.get_view("press_key_error")
             return {
                 "success": False,
-                "message": f"按键失败: {str(e)}",
+                "message": f"按键失败: {exc}",
                 "key": key,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "current_view": view,
             }
 
     async def wait_for_navigation(self, timeout: int = 10000) -> dict:
-        """
-        等待页面导航完成
-        
-        Args:
-            timeout: 超时时间(毫秒)
-            
-        Returns:
-            执行结果字典
-        """
         try:
-            print(f"⏳ 等待页面加载...")
-            await self._page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            print("⏳ 等待页面加载...")
+            page = self._require_active_page()
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout)
             await asyncio.sleep(1)
-            screenshot = await self.capture_state("wait_navigation")
 
+            view = await self.get_view("wait_navigation")
             return {
                 "success": True,
                 "message": "页面加载完成",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "url": page.url,
+                "current_view": view,
             }
+
         except PlaywrightTimeoutError:
-            screenshot = await self.capture_state("wait_timeout")
+            view = await self.get_view("wait_timeout")
             return {
                 "success": False,
                 "message": f"页面加载超时 ({timeout}ms)",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "url": self._current_url(),
+                "current_view": view,
             }
-        except Exception as e:
-            screenshot = await self.capture_state("wait_error")
+
+        except Exception as exc:
+            view = await self.get_view("wait_error")
             return {
                 "success": False,
-                "message": f"等待导航失败: {str(e)}",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "message": f"等待导航失败: {exc}",
+                "url": self._current_url(),
+                "current_view": view,
             }
 
     async def navigate_to(self, url: str, timeout: int = 20000) -> dict:
-        """导航到指定 URL 并确认页面加载"""
         try:
+            page = self._require_active_page()
             print(f"🌍 正在打开: {url}")
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             await asyncio.sleep(1)
-            screenshot = await self.capture_state("navigate_success")
 
+            view = await self.get_view("navigate_success")
             return {
                 "success": True,
                 "message": f"已打开 {url}",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "url": page.url,
+                "current_view": view,
             }
+
         except PlaywrightTimeoutError:
-            screenshot = await self.capture_state("navigate_timeout")
+            view = await self.get_view("navigate_timeout")
             return {
                 "success": False,
                 "message": f"打开 {url} 超时",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "url": self._current_url(),
+                "current_view": view,
             }
-        except Exception as e:
-            screenshot = await self.capture_state("navigate_error")
+
+        except Exception as exc:
+            view = await self.get_view("navigate_error")
             return {
                 "success": False,
-                "message": f"打开 {url} 失败: {str(e)}",
-                "url": self._page.url,
-                "screenshot_path": screenshot["path"],
-                "screenshot_base64": screenshot["base64"],
+                "message": f"打开 {url} 失败: {exc}",
+                "url": self._current_url(),
+                "current_view": view,
             }
 
-    async def plan_action(
-        self,
-        user_goal: str,
-        tool_result: dict | None,
-        attempt_count: int,
-    ) -> dict:
-        """使用 VL 模型进行下一步规划"""
-        screenshot = await self.capture_state("agent_plan")
+    async def scroll_page(self, direction: str, amount: int = 600) -> dict:
+        direction = (direction or "down").lower()
+        amount = int(amount or 600)
+        dx = dy = 0
 
-        tool_feedback = "无"
-        if tool_result:
-            try:
-                import json
+        if direction in {"down", "up"}:
+            dy = amount if direction == "down" else -amount
+        elif direction in {"left", "right"}:
+            dx = -amount if direction == "left" else amount
+        else:
+            view = await self.get_view("scroll_invalid_direction")
+            return {
+                "success": False,
+                "message": f"未知的滚动方向: {direction}",
+                "direction": direction,
+                "current_view": view,
+            }
 
-                tool_feedback = json.dumps(tool_result, ensure_ascii=False)
-            except Exception:
-                tool_feedback = str(tool_result)
+        try:
+            page = self._require_active_page()
+            print(f"🌀 滚动方向: {direction}, 距离: {amount}")
+            await page.mouse.wheel(dx, dy)
+            await asyncio.sleep(0.4)
 
-        prompt = f"""
-你现在控制着一个网页自动化代理，目标是通过多步操作完成用户的需求。
+            view = await self.get_view("scroll_success")
+            return {
+                "success": True,
+                "message": f"成功滚动 {direction} {amount}px",
+                "direction": direction,
+                "amount": amount,
+                "current_view": view,
+            }
 
-用户目标：{user_goal}
-最近一步工具反馈：{tool_feedback}
-当前针对同一动作的尝试次数：{attempt_count} / 5
-
-请仔细观察提供的最新网页截图，判断任务是否已经完成。如果未完成，请规划下一步动作。
-
-动作类型说明：
-- navigate: 打开网址，需要提供 url 字段。
-- click: 点击元素，需要提供 element_description 字段，描述要点击的元素。
-- type: 在当前焦点输入文本，需要提供 text 字段，可选 delay（整数，毫秒）。
-- press_key: 按下键盘按键，需要提供 key 字段。
-- wait: 等待页面加载，需要提供 timeout 字段（毫秒）。
-- finish: 任务结束，不需要额外参数。
-
-请严格输出 JSON 格式，包含以下键：
-{{
-  "current_step": "当前计划的步骤描述",
-  "action_type": "navigate/click/type/press_key/wait/finish",
-  "action_params": {{...}},
-  "next": "tools/end",
-  "reasoning": "简要说明原因"
-}}
-
-只有在确信任务目标已经完成时，才将 next 设置为 "end" 并选择 action_type 为 "finish"。
-如果最新工具反馈 success 为 False 或者你不确定是否成功，请继续规划后续操作。
-""".strip()
-
-        response = self._client.chat.completions.create(
-            model=self._vision_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{screenshot['base64']}",
-                            },
-                        },
-                    ],
-                }
-            ],
-            max_tokens=400,
-            temperature=0.1,
-        )
-
-        raw = response.choices[0].message.content or ""
-        print(f"🧠 VL 规划输出: {raw}")
-        return {
-            "raw_response": raw,
-            "screenshot_path": screenshot["path"],
-            "screenshot_base64": screenshot["base64"],
-        }
+        except Exception as exc:  # noqa: BLE001
+            view = await self.get_view("scroll_error")
+            return {
+                "success": False,
+                "message": f"滚动失败: {exc}",
+                "direction": direction,
+                "amount": amount,
+                "current_view": view,
+            }
